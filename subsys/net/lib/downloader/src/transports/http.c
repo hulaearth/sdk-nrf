@@ -77,31 +77,34 @@ struct transport_params_http {
 
 	/* The following fields are reset before each download: */
 
-	/** The server has closed the connection. */
-	bool connection_close;
-	/** Is using ranged query. */
-	bool ranged;
 	/** Ranged progress */
 	size_t ranged_progress;
+	/** First byte not yet scheduled on the current connection. */
+	size_t pipeline_next;
+	/** Expected byte range for the response currently being parsed. */
+	size_t pipeline_response_next;
+	size_t response_length;
+	size_t response_received;
+
 	/** HTTP header */
 	struct {
 		/** Header length */
 		size_t hdr_len;
 		/** Status code */
 		unsigned long status_code;
+		/** Range metadata collected while parsing fragmented headers. */
+		size_t content_range_start;
+		size_t content_range_end;
+		size_t content_range_total;
+		size_t content_length;
 		/** Whether the HTTP header for
 		 * the current fragment has been processed.
 		 */
 		bool has_end;
 		/** Whether the completed header has been validated. */
 		bool validated;
-		/** Range metadata collected while parsing fragmented headers. */
 		bool has_content_range;
 		bool has_content_length;
-		size_t content_range_start;
-		size_t content_range_end;
-		size_t content_range_total;
-		size_t content_length;
 	} header;
 
 	struct {
@@ -111,24 +114,22 @@ struct transport_params_http {
 		int proto;
 		/** Socket type */
 		int type;
-		/** Port */
-		uint16_t port;
 		/** Destination address storage */
 		struct net_sockaddr remote_addr;
+		/** Port */
+		uint16_t port;
 	} sock;
 
+	/** The server has closed the connection. */
+	bool connection_close;
+	/** Is using ranged query. */
+	bool ranged;
 	/** Request new data */
 	bool new_data_req;
-	/** Number of ranged responses queued on the current connection. */
-	uint8_t pipeline_outstanding;
-	/** First byte not yet scheduled on the current connection. */
-	size_t pipeline_next;
-	/** Expected byte range for the response currently being parsed. */
-	size_t pipeline_response_next;
-	size_t response_length;
-	size_t response_received;
 	/** Enable the bounded range pipeline for this download. */
 	bool pipeline;
+	/** Number of ranged responses queued on the current connection. */
+	uint8_t pipeline_outstanding;
 	/** Redirect retries */
 	uint8_t redirects;
 };
