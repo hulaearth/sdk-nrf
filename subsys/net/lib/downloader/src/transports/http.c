@@ -16,6 +16,7 @@
 #include <net/downloader_transport_http.h>
 #include "dl_socket.h"
 #include "dl_parse.h"
+#include "http_header_search.h"
 
 LOG_MODULE_DECLARE(downloader, CONFIG_DOWNLOADER_LOG_LEVEL);
 
@@ -28,6 +29,8 @@ LOG_MODULE_DECLARE(downloader, CONFIG_DOWNLOADER_LOG_LEVEL);
  * struct downloader_host_cfg to utilize the size better.
  */
 #define TLS_RANGE_MAX 2048
+#define HTTP_PIPELINE_MAX 8
+#define HTTP_PIPELINE_SEND_TIMEOUT_MAX_MS (30 * MSEC_PER_SEC)
 
 #define DEFAULT_PORT_TLS 443
 #define DEFAULT_PORT_TCP 80
@@ -54,7 +57,7 @@ LOG_MODULE_DECLARE(downloader, CONFIG_DOWNLOADER_LOG_LEVEL);
 #define HTTP_GET_OFFSET                                                                            \
 	"GET /%s HTTP/1.1\r\n"                                                                     \
 	"Host: %s\r\n"                                                                             \
-	"Range: bytes=%u-\r\n"                                                                     \
+	"Range: bytes=%zu-\r\n"                                                                   \
 	"Connection: keep-alive\r\n"                                                               \
 	"\r\n"
 
@@ -62,7 +65,7 @@ LOG_MODULE_DECLARE(downloader, CONFIG_DOWNLOADER_LOG_LEVEL);
 #define HTTP_GET_RANGE                                                                             \
 	"GET /%s HTTP/1.1\r\n"                                                                     \
 	"Host: %s\r\n"                                                                             \
-	"Range: bytes=%u-%u\r\n"                                                                   \
+	"Range: bytes=%zu-%zu\r\n"                                                               \
 	"Connection: keep-alive\r\n"                                                               \
 	"\r\n"
 
@@ -90,6 +93,15 @@ struct transport_params_http {
 		 * the current fragment has been processed.
 		 */
 		bool has_end;
+		/** Whether the completed header has been validated. */
+		bool validated;
+		/** Range metadata collected while parsing fragmented headers. */
+		bool has_content_range;
+		bool has_content_length;
+		size_t content_range_start;
+		size_t content_range_end;
+		size_t content_range_total;
+		size_t content_length;
 	} header;
 
 	struct {
@@ -107,40 +119,21 @@ struct transport_params_http {
 
 	/** Request new data */
 	bool new_data_req;
+	/** Number of ranged responses queued on the current connection. */
+	uint8_t pipeline_outstanding;
+	/** First byte not yet scheduled on the current connection. */
+	size_t pipeline_next;
+	/** Expected byte range for the response currently being parsed. */
+	size_t pipeline_response_next;
+	size_t response_length;
+	size_t response_received;
+	/** Enable the bounded range pipeline for this download. */
+	bool pipeline;
 	/** Redirect retries */
 	uint8_t redirects;
 };
 
 BUILD_ASSERT(CONFIG_DOWNLOADER_TRANSPORT_PARAMS_SIZE >= sizeof(struct transport_params_http));
-
-/* Include size flavour of strstr for safety. */
-#if defined(CONFIG_EXTERNAL_LIBC)
-/* Pull in memmem and strnstr due to being an extension to the C library and
- * not included by default.
- */
-extern void *memmem(const void *haystack, size_t hs_len, const void *needle, size_t ne_len);
-extern size_t strnlen(const char *s, size_t maxlen);
-static char *strnstr(const char *haystack, const char *needle, size_t haystack_len)
-{
-	char *x;
-
-	if (!haystack || !needle) {
-		return NULL;
-	}
-	size_t needle_len = strnlen(needle, haystack_len);
-
-	if (needle_len < haystack_len || !needle[needle_len]) {
-		x = memmem(haystack, haystack_len, needle, needle_len);
-		if (x && !memchr(haystack, 0, x - haystack)) {
-			return x;
-		}
-	}
-
-	return NULL;
-}
-#else
-extern char *strnstr(const char *haystack, const char *needle, size_t haystack_sz);
-#endif
 
 static int parse_protocol(struct downloader *dl, const char *url);
 
@@ -155,6 +148,10 @@ static int http_get_request_send(struct downloader *dl)
 	http = (struct transport_params_http *)dl->transport_internal;
 
 	http->header.has_end = false;
+	http->header.validated = false;
+	http->header.status_code = 0;
+	http->header.has_content_range = false;
+	http->header.has_content_length = false;
 
 	/* nRF91 series has a limitation of decoding ~2k of data at once when using TLS */
 	tls_force_range = (http->sock.proto == NET_IPPROTO_TLS_1_2 &&
@@ -213,6 +210,71 @@ send:
 	return 0;
 }
 
+static int http_pipeline_request_send(struct downloader *dl)
+{
+	int len;
+	struct transport_params_http *http = (struct transport_params_http *)dl->transport_internal;
+	size_t start = http->pipeline_next;
+	size_t end = start + dl->host_cfg.range_override - 1;
+
+	if (dl->file_size && end >= dl->file_size) {
+		end = dl->file_size - 1;
+	}
+
+	len = snprintf(dl->cfg.buf, dl->cfg.buf_size, HTTP_GET_RANGE, dl->file, dl->hostname,
+		       start, end);
+	if (len < 0 || len >= dl->cfg.buf_size) {
+		return -ENOMEM;
+	}
+
+	if (dl_socket_send(http->sock.fd, dl->cfg.buf, len)) {
+		LOG_ERR("Failed to send pipelined HTTP request, errno %d", errno);
+		return -ECONNRESET;
+	}
+
+	http->pipeline_next = end + 1;
+	http->pipeline_outstanding++;
+	http->ranged = true;
+	return 0;
+}
+
+static bool http_pipeline_download_active(struct downloader *dl)
+{
+	bool active;
+
+	k_mutex_lock(&dl->mutex, K_FOREVER);
+	active = dl->state == DOWNLOADER_DOWNLOADING;
+	k_mutex_unlock(&dl->mutex);
+
+	return active;
+}
+
+static int http_pipeline_fill(struct downloader *dl)
+{
+	struct transport_params_http *http = (struct transport_params_http *)dl->transport_internal;
+	int err;
+	if (http->connection_close) {
+		return 0;
+	}
+
+	while (http->pipeline_outstanding < http->cfg.pipeline_depth &&
+	       (!dl->file_size || http->pipeline_next < dl->file_size)) {
+		if (!http_pipeline_download_active(dl)) {
+			return 0;
+		}
+		err = http_pipeline_request_send(dl);
+		if (err) {
+			return http_pipeline_download_active(dl) ? err : 0;
+		}
+		/* The first response supplies the total size. Do not guess beyond it. */
+		if (!dl->file_size) {
+			break;
+		}
+	}
+
+	return 0;
+}
+
 /* Returns:
  * Number of bytes parsed on success.
  * Negative errno on error.
@@ -230,7 +292,7 @@ static int http_header_parse(struct downloader *dl, size_t buf_len)
 
 	LOG_HEXDUMP_DBG(dl->cfg.buf, buf_len, "(partial) http header response:");
 
-	p = strnstr(dl->cfg.buf, "\r\n\r\n", buf_len);
+	p = http_header_find(dl->cfg.buf, "\r\n\r\n", buf_len);
 	if (p) {
 		/* End of header received */
 		http->header.has_end = true;
@@ -256,13 +318,42 @@ static int http_header_parse(struct downloader *dl, size_t buf_len)
 	}
 
 	/* Look for the status code just after "http/1.1 " */
-	p = strnstr(dl->cfg.buf, "http/1.1 ", parse_len);
+	p = http_header_find(dl->cfg.buf, "http/1.1 ", parse_len);
 	if (p) {
-		q = strnstr(p, "\r\n", parse_len - (p - dl->cfg.buf));
+		q = http_header_find(p, "\r\n", parse_len - (p - dl->cfg.buf));
 		if (q) {
 			/* Received entire line */
 			p += strlen("http/1.1 ");
 			http->header.status_code = strtoul(p, &q, 10);
+		}
+	}
+
+	if (http->pipeline) {
+		unsigned long value;
+
+		p = http_header_find(dl->cfg.buf, "\r\ncontent-length:", parse_len);
+		if (p) {
+			q = http_header_find(p, "\r\n", parse_len - (p - dl->cfg.buf));
+			if (q && sscanf(p + strlen("\r\ncontent-length:"), " %lu", &value) == 1) {
+				http->header.content_length = value;
+				http->header.has_content_length = true;
+			}
+		}
+
+		p = http_header_find(dl->cfg.buf, "\r\ncontent-range:", parse_len);
+		if (p) {
+			unsigned long start;
+			unsigned long end;
+			unsigned long total;
+
+			q = http_header_find(p, "\r\n", parse_len - (p - dl->cfg.buf));
+			if (q && sscanf(p + strlen("\r\ncontent-range:"),
+					" bytes %lu-%lu/%lu", &start, &end, &total) == 3) {
+				http->header.content_range_start = start;
+				http->header.content_range_end = end;
+				http->header.content_range_total = total;
+				http->header.has_content_range = true;
+			}
 		}
 	}
 
@@ -272,9 +363,9 @@ static int http_header_parse(struct downloader *dl, size_t buf_len)
 	    http->header.status_code == HTTP_RESPONSE_TEMPORARY_REDIRECT ||
 	    http->header.status_code == HTTP_RESPONSE_PERMANENT_REDIRECT) {
 		/* Resource is moved, update host and file before reconnecting. */
-		p = strnstr(dl->cfg.buf, "\r\nlocation:", parse_len);
+		p = http_header_find(dl->cfg.buf, "\r\nlocation:", parse_len);
 		if (p) {
-			q = strnstr((p + 1), "\r\n", parse_len - ((p + 1) - dl->cfg.buf));
+			q = http_header_find((p + 1), "\r\n", parse_len - ((p + 1) - dl->cfg.buf));
 			if (q) {
 
 				/* Received entire line */
@@ -327,21 +418,21 @@ static int http_header_parse(struct downloader *dl, size_t buf_len)
 	do {
 		if (dl->file_size == 0) {
 			if (http->ranged) {
-				p = strnstr(dl->cfg.buf, "\r\ncontent-range", parse_len);
+				p = http_header_find(dl->cfg.buf, "\r\ncontent-range", parse_len);
 				if (!p) {
 					break;
 				}
-				p = strnstr(p, "/", parse_len - (p - dl->cfg.buf));
+				p = http_header_find(p, "/", parse_len - (p - dl->cfg.buf));
 				if (!p) {
 					break;
 				}
-				q = strnstr(p, "\r\n", parse_len - (p - dl->cfg.buf));
+				q = http_header_find(p, "\r\n", parse_len - (p - dl->cfg.buf));
 				if (!q) {
 					/* Missing end of line */
 					break;
 				}
 			} else { /* proto == PROTO_HTTP */
-				p = strnstr(dl->cfg.buf, "\r\ncontent-length", parse_len);
+				p = http_header_find(dl->cfg.buf, "\r\ncontent-length", parse_len);
 				if (!p) {
 					break;
 				}
@@ -349,7 +440,7 @@ static int http_header_parse(struct downloader *dl, size_t buf_len)
 				if (!p) {
 					break;
 				}
-				q = strnstr(p, "\r\n", parse_len - (p - dl->cfg.buf));
+				q = http_header_find(p, "\r\n", parse_len - (p - dl->cfg.buf));
 				if (!q) {
 					/* Missing end of line */
 					break;
@@ -365,13 +456,13 @@ static int http_header_parse(struct downloader *dl, size_t buf_len)
 		}
 	} while (0);
 
-	p = strnstr(dl->cfg.buf, "\r\nconnection: close", parse_len);
+	p = http_header_find(dl->cfg.buf, "\r\nconnection: close", parse_len);
 	if (p) {
 		LOG_WRN("Peer closed connection, will re-connect");
 		http->connection_close = true;
 	}
 
-	if (http->header.has_end) {
+	if (http->header.has_end && !http->header.validated) {
 		/* We have received the end of the header.
 		 * Verify that we have received everything that we need.
 		 */
@@ -392,6 +483,26 @@ static int http_header_parse(struct downloader *dl, size_t buf_len)
 			LOG_ERR("File size not set");
 			return -EBADMSG;
 		}
+
+		if (http->pipeline) {
+			if (!http->header.has_content_range || !http->header.has_content_length ||
+			    http->header.content_range_start != http->pipeline_response_next ||
+			    http->header.content_range_end < http->header.content_range_start ||
+			    http->header.content_range_end > http->header.content_range_start +
+								       dl->host_cfg.range_override - 1 ||
+			    http->header.content_range_total != dl->file_size ||
+			    http->header.content_length != http->header.content_range_end -
+									 http->header.content_range_start + 1 ||
+			    http->header.content_range_end !=
+				    MIN(http->header.content_range_start + dl->host_cfg.range_override - 1,
+					     dl->file_size - 1)) {
+				LOG_ERR("Invalid HTTP range response");
+				return -EBADMSG;
+			}
+			http->response_length = http->header.content_length;
+			http->pipeline_response_next = http->header.content_range_end + 1;
+		}
+		http->header.validated = true;
 
 		return parse_len;
 	}
@@ -527,6 +638,7 @@ static int parse_protocol(struct downloader *dl, const char *url)
 static int dl_http_init(struct downloader *dl, struct downloader_host_cfg *dl_host_cfg,
 			const char *url)
 {
+	int err;
 	struct transport_params_http *http;
 	uint8_t *reset_ptr;
 
@@ -535,6 +647,13 @@ static int dl_http_init(struct downloader *dl, struct downloader_host_cfg *dl_ho
 	if (!http->cfg_set) {
 		/* Set socket receive timeout to 30s by default. */
 		http->cfg.sock_recv_timeo_ms = 30 * MSEC_PER_SEC;
+		http->cfg.pipeline_depth = 1;
+	}
+	if (http->cfg.pipeline_depth == 0) {
+		http->cfg.pipeline_depth = 1;
+	}
+	if (http->cfg.pipeline_depth > HTTP_PIPELINE_MAX) {
+		return -EINVAL;
 	}
 
 	/* Reset all fields after the config. */
@@ -543,7 +662,19 @@ static int dl_http_init(struct downloader *dl, struct downloader_host_cfg *dl_ho
 	       0,
 	       sizeof(struct transport_params_http) - ((uint8_t *)reset_ptr - (uint8_t *)http));
 
-	return parse_protocol(dl, url);
+	err = parse_protocol(dl, url);
+	if (err) {
+		return err;
+	}
+	http->pipeline = http->cfg.pipeline_depth > 1 && dl_host_cfg->range_override &&
+			!dl_host_cfg->keep_connection;
+	if (http->pipeline && http->sock.proto == NET_IPPROTO_TLS_1_2 &&
+	    !dl_host_cfg->set_native_tls && IS_ENABLED(CONFIG_SOC_SERIES_NRF91) &&
+	    dl_host_cfg->range_override > TLS_RANGE_MAX) {
+		LOG_WRN("Range override > TLS max range, setting to TLS max range");
+		dl_host_cfg->range_override = TLS_RANGE_MAX;
+	}
+	return 0;
 }
 
 static int dl_http_deinit(struct downloader *dl)
@@ -575,6 +706,20 @@ static int dl_http_connect(struct downloader *dl)
 		return err;
 	}
 
+	if (http->pipeline) {
+		uint32_t send_timeout_ms = http->cfg.sock_recv_timeo_ms;
+
+		if (send_timeout_ms == 0 || send_timeout_ms > HTTP_PIPELINE_SEND_TIMEOUT_MAX_MS) {
+			send_timeout_ms = HTTP_PIPELINE_SEND_TIMEOUT_MAX_MS;
+		}
+		err = dl_socket_send_timeout_set(http->sock.fd, send_timeout_ms);
+		if (err) {
+			LOG_ERR("Failed to set http send timeout, err %d", err);
+			dl_socket_close(&http->sock.fd);
+			return err;
+		}
+	}
+
 	err = dl_socket_recv_timeout_set(http->sock.fd, http->cfg.sock_recv_timeo_ms);
 	if (err) {
 		/* Unable to set timeout, close socket */
@@ -585,6 +730,17 @@ static int dl_http_connect(struct downloader *dl)
 
 	http->connection_close = false;
 	http->new_data_req = true;
+	http->pipeline_outstanding = 0;
+	http->pipeline_next = dl->progress;
+	http->pipeline_response_next = dl->progress;
+	http->response_received = 0;
+	http->response_length = 0;
+	http->header.has_end = false;
+	http->header.status_code = 0;
+	http->header.validated = false;
+	http->header.has_content_range = false;
+	http->header.has_content_length = false;
+	dl->buf_offset = 0;
 
 	return err;
 }
@@ -606,12 +762,164 @@ static int dl_http_close(struct downloader *dl)
 	return -EBADF;
 }
 
+static int dl_http_pipeline_download(struct downloader *dl,
+				    struct transport_params_http *http)
+{
+	int recv_len;
+	int data_len;
+	size_t parse_len;
+	size_t payload_len;
+	size_t accepted_len;
+	size_t remaining;
+	size_t required_len;
+	int err;
+
+	if (http->pipeline_outstanding == 0 && dl->buf_offset == 0) {
+		http->pipeline_next = dl->progress;
+		http->new_data_req = true;
+		err = http_pipeline_fill(dl);
+		if (err) {
+			return http_pipeline_download_active(dl) ? -ECONNRESET : 0;
+		}
+		http->new_data_req = false;
+		if (!http_pipeline_download_active(dl)) {
+			return 0;
+		}
+	}
+
+	while (true) {
+		bool from_buffer = dl->buf_offset != 0;
+
+		if (from_buffer) {
+			if (!http->header.has_end && http->pipeline_outstanding == 0) {
+				return http_pipeline_download_active(dl) ? -EBADMSG : 0;
+			}
+			recv_len = 0;
+			parse_len = dl->buf_offset;
+		} else {
+			recv_len = dl_socket_recv(http->sock.fd, dl->cfg.buf,
+					  dl->cfg.buf_size);
+			if (recv_len < 0) {
+				if (!http_pipeline_download_active(dl)) {
+					return 0;
+				}
+				return http->connection_close ? -ECONNRESET : recv_len;
+			}
+			parse_len = recv_len;
+		}
+
+		data_len = http_parse(dl, parse_len);
+		if (data_len < 0) {
+			return http_pipeline_download_active(dl) ? data_len : 0;
+		}
+		if (!http->header.has_end) {
+			if (from_buffer) {
+				goto receive_more;
+			}
+			if (recv_len > 0) {
+				return 0;
+			}
+			return http_pipeline_download_active(dl) ? -ECONNRESET : 0;
+		}
+
+		payload_len = data_len;
+		remaining = http->response_length - http->response_received;
+		accepted_len = MIN(payload_len, remaining);
+		required_len = MIN(MIN_SIZE_IDENTIFY_BUF,
+				   MIN(remaining, dl->file_size - dl->progress));
+		if (accepted_len < required_len) {
+			if (from_buffer) {
+				goto receive_more;
+			}
+			if (recv_len == 0) {
+				return http_pipeline_download_active(dl) ? -ECONNRESET : 0;
+			}
+			dl->buf_offset = data_len;
+			return 0;
+		}
+		k_mutex_lock(&dl->mutex, K_FOREVER);
+		bool active = dl->state == DOWNLOADER_DOWNLOADING;
+		k_mutex_unlock(&dl->mutex);
+		if (!active) {
+			return 0;
+		}
+
+		dl->progress += accepted_len;
+		http->response_received += accepted_len;
+		dl_transport_evt_data(dl, dl->cfg.buf, accepted_len);
+		k_mutex_lock(&dl->mutex, K_FOREVER);
+		active = dl->state == DOWNLOADER_DOWNLOADING;
+		k_mutex_unlock(&dl->mutex);
+		if (!active) {
+			return 0;
+		}
+
+		if (http->response_received == http->response_length) {
+			size_t leftover = payload_len - accepted_len;
+
+			if (leftover) {
+				memmove(dl->cfg.buf, dl->cfg.buf + accepted_len, leftover);
+			}
+			dl->buf_offset = leftover;
+			http->header.has_end = false;
+			http->header.status_code = 0;
+			http->header.validated = false;
+			http->header.has_content_range = false;
+			http->header.has_content_length = false;
+			http->response_length = 0;
+			http->response_received = 0;
+			http->pipeline_outstanding--;
+			if (dl->progress == dl->file_size) {
+				dl->complete = true;
+				http->new_data_req = true;
+				return 0;
+			}
+			if (http->connection_close) {
+				return http_pipeline_download_active(dl) ? -ECONNRESET : 0;
+			}
+			if (leftover) {
+				continue;
+			}
+			if (http->pipeline_next < dl->file_size) {
+					err = http_pipeline_fill(dl);
+				if (err) {
+					return http_pipeline_download_active(dl) ? -ECONNRESET : 0;
+				}
+				if (!http_pipeline_download_active(dl)) {
+					return 0;
+				}
+			}
+			return 0;
+		}
+
+		dl->buf_offset = 0;
+		return 0;
+
+receive_more:
+		recv_len = dl_socket_recv(http->sock.fd, dl->cfg.buf + dl->buf_offset,
+					  dl->cfg.buf_size - dl->buf_offset);
+		if (recv_len < 0) {
+			if (!http_pipeline_download_active(dl)) {
+				return 0;
+			}
+			return http->connection_close ? -ECONNRESET : recv_len;
+		}
+		if (recv_len == 0) {
+			return http_pipeline_download_active(dl) ? -ECONNRESET : 0;
+		}
+		dl->buf_offset += recv_len;
+	}
+}
+
 static int dl_http_download(struct downloader *dl)
 {
 	int ret, recv_len, data_len, expected_len;
 	struct transport_params_http *http;
 
 	http = (struct transport_params_http *)dl->transport_internal;
+	if (http->pipeline) {
+		return dl_http_pipeline_download(dl, http);
+	}
 
 	if (http->new_data_req) {
 		/* Request next fragment */
@@ -714,6 +1022,9 @@ int downloader_transport_http_set_config(struct downloader *dl,
 	struct transport_params_http *http;
 
 	if (!dl || !cfg) {
+		return -EINVAL;
+	}
+	if (cfg->pipeline_depth > HTTP_PIPELINE_MAX) {
 		return -EINVAL;
 	}
 
