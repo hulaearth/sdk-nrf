@@ -925,7 +925,7 @@ static ssize_t z_impl_zsock_recvfrom_http_pipeline(int sock, void *buf, size_t m
 {
 	const char *parts[] = {PIPELINE_PART_0, PIPELINE_PART_1, PIPELINE_PART_2};
 	size_t header_len;
-	size_t split_len = strlen("HTTP/1.1 206 Partial Content\r\nContent-Length: 32\r\n");
+	size_t split_len = strlen("HTTP/1.");
 
 	TEST_ASSERT_EQUAL(FD, sock);
 	if (z_impl_zsock_recvfrom_fake.call_count == 1) {
@@ -953,6 +953,15 @@ static ssize_t z_impl_zsock_recvfrom_http_pipeline(int sock, void *buf, size_t m
 		return first + 32 + second + 32;
 	}
 	return 0;
+}
+
+static ssize_t z_impl_zsock_recvfrom_http_pipeline_no_line_end(
+	int sock, void *buf, size_t max_len, int flags, struct net_sockaddr *src_addr,
+	net_socklen_t *addrlen)
+{
+	TEST_ASSERT_EQUAL(FD, sock);
+	memset(buf, 'x', max_len);
+	return max_len;
 }
 
 static ssize_t z_impl_zsock_sendto_http_pipeline_record(int sock, const void *buf, size_t len,
@@ -1847,6 +1856,40 @@ void test_downloader_get_https_pipeline_ordered_coalesced(void)
 	TEST_ASSERT_EQUAL(96, dl.progress);
 	TEST_ASSERT_EQUAL(4, z_impl_zsock_recvfrom_fake.call_count);
 	TEST_ASSERT_EQUAL(3, z_impl_zsock_sendto_fake.call_count);
+
+	downloader_deinit(&dl);
+	dl_wait_for_event(DOWNLOADER_EVT_DEINITIALIZED, K_SECONDS(1));
+}
+
+void test_downloader_get_https_pipeline_rejects_full_status_line(void)
+{
+	int err;
+	struct downloader_evt evt;
+	struct downloader_transport_http_cfg cfg = {
+		.sock_recv_timeo_ms = 60000,
+		.pipeline_depth = 2,
+	};
+	struct downloader_host_cfg host_cfg = dl_host_conf_w_sec_tags_range_override_32;
+	host_cfg.keep_connection = false;
+
+	err = downloader_init(&dl, &dl_cfg_cb_abort);
+	TEST_ASSERT_EQUAL(0, err);
+	err = downloader_transport_http_set_config(&dl, &cfg);
+	TEST_ASSERT_EQUAL(0, err);
+	zsock_getaddrinfo_fake.custom_fake = zsock_getaddrinfo_server_ok;
+	zsock_freeaddrinfo_fake.custom_fake = zsock_freeaddrinfo_server_ipv6;
+	z_impl_zsock_socket_fake.custom_fake = z_impl_zsock_socket_https_ipv6_ok;
+	z_impl_zsock_connect_fake.custom_fake = z_impl_zsock_connect_ipv6_ok;
+	z_impl_zsock_setsockopt_fake.custom_fake = z_impl_zsock_setsockopt_https_ok;
+	z_impl_zsock_sendto_fake.custom_fake = z_impl_zsock_sendto_ok;
+	z_impl_zsock_recvfrom_fake.custom_fake = z_impl_zsock_recvfrom_http_pipeline_no_line_end;
+
+	err = downloader_get(&dl, &host_cfg, HTTPS_URL, 0);
+	TEST_ASSERT_EQUAL(0, err);
+	evt = dl_wait_for_event(DOWNLOADER_EVT_ERROR, K_SECONDS(3));
+	TEST_ASSERT_EQUAL(-E2BIG, evt.error);
+	TEST_ASSERT_EQUAL(1, z_impl_zsock_recvfrom_fake.call_count);
+	dl_wait_for_event(DOWNLOADER_EVT_STOPPED, K_SECONDS(1));
 
 	downloader_deinit(&dl);
 	dl_wait_for_event(DOWNLOADER_EVT_DEINITIALIZED, K_SECONDS(1));

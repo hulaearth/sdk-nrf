@@ -559,6 +559,9 @@ static int http_parse(struct downloader *dl, size_t len)
 			len = len - parsed_len;
 			memmove(dl->cfg.buf, dl->cfg.buf + parsed_len, len);
 			dl->buf_offset = len;
+		} else {
+			/* Retain the incomplete first line for the next receive. */
+			dl->buf_offset = len;
 		}
 
 		if (!http->header.has_end) {
