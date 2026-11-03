@@ -24,6 +24,8 @@
 struct downloader_transport_http_cfg {
 	/** Socket receive timeout in milliseconds. The default timeout is 30000 ms. */
 	uint32_t sock_recv_timeo_ms;
+	/** Outstanding ranged requests. Zero means one. The maximum is eight. */
+	uint8_t pipeline_depth;
 };
 
 /**
